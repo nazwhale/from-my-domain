@@ -1,0 +1,24 @@
+# Ignore the email spool directory
+spool/
+
+# Ignore compiled binary
+go-smtp-server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Ignore testing and coverage files
+*.test
+*.out
+
+# Ignore Go workspace file
+go.work
+
+# Ignore common OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo 
