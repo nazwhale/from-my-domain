@@ -67,6 +67,18 @@ func main() {
 - `main.go` - Server entry point
 - `spool/` - Directory for queued email storage
 
+## Testing with Swaks
+
+```bash
+swaks \
+  --server localhost:2525 \
+  --tls \
+  --from you@yourdomain.com \
+  --to yourgmailusername@gmail.com \
+  --header "Subject: hello relay" \
+  --body   "first hop through smtpmini"
+```
+
 ## Development
 
 This project is a functional SMTP server implementation suitable for development, testing, and production use cases with modest email volume requirements. 

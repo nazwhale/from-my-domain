@@ -15,18 +15,19 @@ import (
 	"time"
 )
 
-// Message is what we store on disk.
+// ─── on‑disk message schema ───────────────────────────────────────────────────
+
 type Message struct {
 	ID        string    `json:"id"`
 	From      string    `json:"from"`
 	Rcpts     []string  `json:"rcpts"`
-	Data      string    `json:"data"` // full RFC‑822 string \r\n terminated
+	Data      string    `json:"data"` // full RFC‑822 string ending in \r\n
 	Attempts  int       `json:"attempts"`
 	LastError string    `json:"last_error,omitempty"`
 	NextTry   time.Time `json:"next_try"`
 }
 
-// ---------- persistent queue helpers ----------------------------------------
+// ─── queue helpers ───────────────────────────────────────────────────────────
 
 const spoolDir = "spool"
 
@@ -35,8 +36,7 @@ func init() { _ = os.MkdirAll(spoolDir, 0o755) }
 func enqueue(m *Message) error {
 	m.ID = fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), strings.ReplaceAll(m.From, "@", "_"))
 	m.NextTry = time.Now()
-	path := filepath.Join(spoolDir, m.ID)
-	f, err := os.Create(path)
+	f, err := os.Create(filepath.Join(spoolDir, m.ID))
 	if err != nil {
 		return err
 	}
@@ -44,7 +44,6 @@ func enqueue(m *Message) error {
 	return json.NewEncoder(f).Encode(m)
 }
 
-// load all *.json files
 func loadQueued() ([]*Message, error) {
 	var ms []*Message
 	err := filepath.WalkDir(spoolDir, func(p string, d fs.DirEntry, _ error) error {
@@ -72,95 +71,127 @@ func persist(m *Message) {
 	_ = json.NewEncoder(f).Encode(m)
 }
 
-// ---------- outbound SMTP delivery ------------------------------------------
+// ─── outbound SMTP ───────────────────────────────────────────────────────────
 
 func deliver(m *Message) error {
 	// 1) MX lookup
-	host := ""
-	if mx, err := net.LookupMX(m.Rcpts[0][strings.LastIndex(m.Rcpts[0], "@")+1:]); err == nil && len(mx) > 0 {
+	domain := m.Rcpts[0][strings.LastIndexByte(m.Rcpts[0], '@')+1:]
+	var host string
+	if mx, err := net.LookupMX(domain); err == nil && len(mx) > 0 {
 		host = mx[0].Host
 	}
 	if host == "" {
-		return fmt.Errorf("no MX found")
+		return fmt.Errorf("no MX found for %s", domain)
 	}
 	addr := net.JoinHostPort(host, "25")
 
-	// 2) open connection & optional STARTTLS
+	// 2) connect
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	tp := textproto.NewConn(conn)
 
-	text := textproto.NewConn(conn)
-	defer text.Close()
+	read := func(expect int) error { _, _, err := tp.ReadResponse(expect); return err }
 
-	readCode := func(expected int) error {
-		code, _, err := text.ReadResponse(expected)
-		if err != nil || code != expected {
-			return fmt.Errorf("want %d got %v %v", expected, code, err)
-		}
-		return nil
-	}
-
-	if err := readCode(220); err != nil {
+	if err := read(220); err != nil {
 		return err
 	}
-	_ = text.PrintfLine("EHLO smtpmini.local")
-	line, _ := text.ReadLine()
-	if !strings.HasPrefix(line, "250") {
-		return fmt.Errorf("EHLO rejected")
+
+	// 3) EHLO + STARTTLS detection / upgrade
+	supportsTLS, err := ehlo(tp)
+	if err != nil {
+		return err
 	}
-	if strings.Contains(line, "STARTTLS") { // multi‑line banners ignored for brevity
-		_ = text.PrintfLine("STARTTLS")
-		if err := readCode(220); err != nil {
+	if supportsTLS {
+		if err := tp.PrintfLine("STARTTLS"); err != nil {
+			return err
+		}
+		if err := read(220); err != nil {
 			return err
 		}
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, InsecureSkipVerify: true})
 		if err := tlsConn.Handshake(); err != nil {
 			return err
 		}
-		text = textproto.NewConn(tlsConn)
-		_ = text.PrintfLine("EHLO smtpmini.local")
-		if err := readCode(250); err != nil {
+		tp = textproto.NewConn(tlsConn)
+		if _, err = ehlo(tp); err != nil {
 			return err
 		}
 	}
 
-	// 3) envelope
-	_ = text.PrintfLine("MAIL FROM:<%s>", m.From)
-	if err := readCode(250); err != nil {
+	// 4) envelope
+	if err := tp.PrintfLine("MAIL FROM:<%s>", m.From); err != nil {
 		return err
 	}
-	for _, r := range m.Rcpts {
-		_ = text.PrintfLine("RCPT TO:<%s>", r)
-		if err := readCode(250); err != nil {
+	if err := read(250); err != nil {
+		return err
+	}
+	for _, rcpt := range m.Rcpts {
+		if err := tp.PrintfLine("RCPT TO:<%s>", rcpt); err != nil {
+			return err
+		}
+		if err := read(250); err != nil {
 			return err
 		}
 	}
-	_ = text.PrintfLine("DATA")
-	if err := readCode(354); err != nil {
+
+	// 5) DATA
+	if err := tp.PrintfLine("DATA"); err != nil {
 		return err
 	}
-	// dot‑stuff body
+	if err := read(354); err != nil {
+		return err
+	}
 	dotted := strings.ReplaceAll(m.Data, "\n.", "\n..")
-	_ = text.PrintfLine("%s\r\n.", dotted)
-	if err := readCode(250); err != nil {
+	if err := tp.PrintfLine("%s\r\n.", dotted); err != nil {
 		return err
 	}
-	_ = text.PrintfLine("QUIT")
+	if err := read(250); err != nil {
+		return err
+	}
+	_ = tp.PrintfLine("QUIT")
 	return nil
 }
 
-// ---------- background scheduler --------------------------------------------
+// ehlo sends EHLO and drains **all** 250‑ lines, returning whether STARTTLS
+// was advertised.
+func ehlo(tp *textproto.Conn) (supportsTLS bool, err error) {
+	if err = tp.PrintfLine("EHLO smtpmini.local"); err != nil {
+		return
+	}
+	for {
+		line, e := tp.ReadLine()
+		if e != nil {
+			err = e
+			return
+		}
+		if strings.HasPrefix(line, "250-") {
+			if strings.Contains(line, "STARTTLS") {
+				supportsTLS = true
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "250 ") { // last line
+			if strings.Contains(line, "STARTTLS") {
+				supportsTLS = true
+			}
+			return
+		}
+		return false, fmt.Errorf("unexpected EHLO line: %s", line)
+	}
+}
+
+// ─── retry scheduler ─────────────────────────────────────────────────────────
 
 func launchScheduler() {
 	go func() {
 		for {
-			ms, _ := loadQueued()
+			msgs, _ := loadQueued()
 			now := time.Now()
-			for _, m := range ms {
-				if m.NextTry.After(now) { // back‑off window
+			for _, m := range msgs {
+				if m.NextTry.After(now) {
 					continue
 				}
 				if err := deliver(m); err != nil {
@@ -179,11 +210,11 @@ func launchScheduler() {
 	}()
 }
 
-// ---------- helper for server side ------------------------------------------
+// ─── called from server side ─────────────────────────────────────────────────
 
 func queueMessage(from string, rcpts []string, data string) {
-	m := &Message{From: from, Rcpts: rcpts, Data: data}
-	if err := enqueue(m); err != nil {
+	msg := &Message{From: from, Rcpts: rcpts, Data: data}
+	if err := enqueue(msg); err != nil {
 		log.Printf("[queue] enqueue error: %v", err)
 	}
 }
